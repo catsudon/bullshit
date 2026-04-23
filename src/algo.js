@@ -211,9 +211,9 @@ function segmentVsObstacle(ax, ay, bx, by, obs) {
  * @returns {Array<{x,y}>}  resolved path (may have extra vertices)
  */
 function resolveEdges(path, obstacles, pushStrength, maxIter, deadline) {
-  const MAX_PASSES    = 8;    // reduced: 32 was too expensive for overlapping obstacles
-  const MAX_PATH_LEN  = 1500; // bail if path grows beyond this (overlapping obstacles trap)
-  let prevInsertCount = -1;   // convergence detection: stop if count stops shrinking
+  const MAX_PASSES    = 6;
+  const MAX_PATH_LEN  = 600;
+  let prevInsertCount = -1;
 
   for (let pass = 0; pass < MAX_PASSES; pass++) {
     // Guard 1: wall-clock timeout (shared with outer Chaikin loop)
@@ -237,24 +237,35 @@ function resolveEdges(path, obstacles, pushStrength, maxIter, deadline) {
         const mx = A.x + (B.x - A.x) * tMid;
         const my = A.y + (B.y - A.y) * tMid;
 
-        // Push PERPENDICULAR to the segment direction, not to the nearest face.
-        // Nearest-face push causes A→M sub-segment to re-enter through the same face.
-        // Perpendicular push sends M to the top/bottom of the obstacle so
-        // sub-segments A→M and M→B bypass it on one side.
+        // Compute EXACT distance to push (mx,my) in direction (perpX,perpY)
+        // to exit this specific obstacle — no fixed cap that might fall short.
         const segLen = Math.sqrt(segLenSq);
-        const perpX  = -(B.y - A.y) / segLen; // 90° CCW unit vector
+        const perpX  = -(B.y - A.y) / segLen;
         const perpY  =  (B.x - A.x) / segLen;
-
-        // Distance needed to escape in the perpendicular direction
         let pushDist;
         if (obs.type === 'circle') {
-          pushDist = obs.r + 2;
+          // Solve quadratic: |(midpoint + t*perp) - center|² = r²
+          const fx = mx - obs.x, fy = my - obs.y;
+          const b  = 2 * (fx * perpX + fy * perpY);
+          const c  = fx*fx + fy*fy - obs.r*obs.r;
+          const disc = b*b - 4*c; // a=1 since perp is unit
+          pushDist = disc >= 0 ? Math.max((-b + Math.sqrt(disc)) / 2, 0) + 2 : obs.r + 2;
         } else {
-          // Distance from midpoint to the closer horizontal face
-          const localY = my - obs.y;
-          pushDist = Math.min(localY, obs.h - localY) + 2;
-          if (pushDist < 2) pushDist = Math.max(obs.w, obs.h) / 2 + 2;
+          // Ray from inside rect — find first exit face in perp direction
+          let tExit = Infinity;
+          if (Math.abs(perpX) > 1e-9) {
+            const t = perpX > 0 ? (obs.x + obs.w - mx) / perpX : (obs.x - mx) / perpX;
+            if (t > 0) tExit = Math.min(tExit, t);
+          }
+          if (Math.abs(perpY) > 1e-9) {
+            const t = perpY > 0 ? (obs.y + obs.h - my) / perpY : (obs.y - my) / perpY;
+            if (t > 0) tExit = Math.min(tExit, t);
+          }
+          pushDist = (tExit === Infinity ? Math.max(obs.w, obs.h) / 2 : tExit) + 2;
         }
+        // Safety cap: very large obstacles in overlapping configs can produce
+        // extreme pushDist. Cap at 200px — enough for any single obstacle.
+        pushDist = Math.min(pushDist, 200);
 
         // Try both perpendicular directions; use whichever exits this obstacle
         const c1 = { x: mx + perpX * pushDist, y: my + perpY * pushDist };
@@ -390,15 +401,17 @@ function collisionAwareChaikin(controlPoints, obstacles, iterations = 4, alpha =
   const collisionPoints = [];
 
   for (let iter = 0; iter < iterations; iter++) {
-    // Global timeout guard — bail entire Chaikin loop if over budget
     if (performance.now() > deadline) break;
 
     const isLastIter = (iter === iterations - 1);
 
-    // 1. Standard subdivision pass
+    // 1. Guard: stop subdividing if path is already too long
+    if (path.length > 600) break;
+
+    // 2. Standard subdivision pass
     path = chaikinPass(path, alpha);
 
-    // 2. Vertex resolution: push any vertex that landed inside an obstacle
+    // 3. Vertex resolution
     for (let i = 0; i < path.length; i++) {
       if (i === 0 || i === path.length - 1) continue;
       const before = { x: path[i].x, y: path[i].y };
@@ -412,11 +425,17 @@ function collisionAwareChaikin(controlPoints, obstacles, iterations = 4, alpha =
       path[i] = pt;
     }
 
-    // 3. Edge resolution: insert resolved midpoints for tunnelling segments.
-    //    Pass the deadline so resolveEdges can bail early too.
+    // 4. Edge resolution — always run (skipping it silently allows violations)
     const lenBefore = path.length;
     path = resolveEdges(path, obstacles, pushStrength, maxPushIter, deadline);
     totalPushes += (path.length - lenBefore);
+  }
+
+  // Final cleanup: one more vertex-resolve pass to catch any remaining violations
+  // (edge insertions in the last iteration may have landed on obstacle boundaries)
+  for (let i = 1; i < path.length - 1; i++) {
+    const { pt } = resolveVertex(path[i], obstacles, pushStrength, maxPushIter);
+    path[i] = pt;
   }
 
   const timeUs = (performance.now() - t0) * 1000;
