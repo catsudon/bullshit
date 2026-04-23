@@ -210,30 +210,83 @@ function segmentVsObstacle(ax, ay, bx, by, obs) {
  * @param {number}       maxIter      - vertex push iterations
  * @returns {Array<{x,y}>}  resolved path (may have extra vertices)
  */
-function resolveEdges(path, obstacles, pushStrength, maxIter) {
-  const MAX_PASSES = 32; // safety cap — each pass at least halves uncrossed length
+function resolveEdges(path, obstacles, pushStrength, maxIter, deadline) {
+  const MAX_PASSES    = 8;    // reduced: 32 was too expensive for overlapping obstacles
+  const MAX_PATH_LEN  = 1500; // bail if path grows beyond this (overlapping obstacles trap)
+  let prevInsertCount = -1;   // convergence detection: stop if count stops shrinking
 
   for (let pass = 0; pass < MAX_PASSES; pass++) {
+    // Guard 1: wall-clock timeout (shared with outer Chaikin loop)
+    if (deadline && performance.now() > deadline) break;
+    // Guard 2: path grew too large — overlapping obstacles with no escape
+    if (path.length > MAX_PATH_LEN) break;
+
     const insertions = [];
 
     for (let i = 0; i < path.length - 1; i++) {
       const A = path[i], B = path[i + 1];
+      const segLenSq = (B.x - A.x) ** 2 + (B.y - A.y) ** 2;
+      if (segLenSq < 0.01) continue; // skip degenerate zero-length edges
+
       for (const obs of obstacles) {
         const hit = segmentVsObstacle(A.x, A.y, B.x, B.y, obs);
         if (!hit.hit) continue;
-        // Midpoint of the intersection chord (guaranteed inside obstacle)
+
+        // Midpoint of the intersection chord — guaranteed inside the obstacle
         const tMid = (hit.tEntry + hit.tExit) / 2;
         const mx = A.x + (B.x - A.x) * tMid;
         const my = A.y + (B.y - A.y) * tMid;
-        // Push it out of all obstacles
-        const { pt } = resolveVertex({ x: mx, y: my }, obstacles, pushStrength, maxIter);
-        insertions.push({ after: i, pt });
-        break; // one insertion per edge, re-scan next pass
+
+        // Push PERPENDICULAR to the segment direction, not to the nearest face.
+        // Nearest-face push causes A→M sub-segment to re-enter through the same face.
+        // Perpendicular push sends M to the top/bottom of the obstacle so
+        // sub-segments A→M and M→B bypass it on one side.
+        const segLen = Math.sqrt(segLenSq);
+        const perpX  = -(B.y - A.y) / segLen; // 90° CCW unit vector
+        const perpY  =  (B.x - A.x) / segLen;
+
+        // Distance needed to escape in the perpendicular direction
+        let pushDist;
+        if (obs.type === 'circle') {
+          pushDist = obs.r + 2;
+        } else {
+          // Distance from midpoint to the closer horizontal face
+          const localY = my - obs.y;
+          pushDist = Math.min(localY, obs.h - localY) + 2;
+          if (pushDist < 2) pushDist = Math.max(obs.w, obs.h) / 2 + 2;
+        }
+
+        // Try both perpendicular directions; use whichever exits this obstacle
+        const c1 = { x: mx + perpX * pushDist, y: my + perpY * pushDist };
+        const c2 = { x: mx - perpX * pushDist, y: my - perpY * pushDist };
+        let candidate;
+        if      (!testPoint(c1.x, c1.y, obs).inside) candidate = c1;
+        else if (!testPoint(c2.x, c2.y, obs).inside) candidate = c2;
+        else {
+          // Perp push insufficient (very thick obstacle) — fall back
+          candidate = resolveVertex({ x: mx, y: my }, obstacles, pushStrength * 2, maxIter * 2).pt;
+        }
+
+        // Resolve against ALL obstacles (candidate might overlap another obstacle)
+        const { pt } = resolveVertex(candidate, obstacles, pushStrength, maxIter);
+
+        // Only insert if meaningfully distinct from both endpoints
+        // (prevents zero-length re-insertion loops)
+        const dA = (pt.x - A.x) ** 2 + (pt.y - A.y) ** 2;
+        const dB = (pt.x - B.x) ** 2 + (pt.y - B.y) ** 2;
+        if (dA > 1 && dB > 1) insertions.push({ after: i, pt });
+        break;
+
       }
     }
 
     // No crossings found — path is fully clear
-    if (insertions.length === 0) break;
+    if (insertions.length === 0) break; // fully converged
+
+    // Guard 3: convergence check — if insertion count is not decreasing we are stuck
+    // (happens when obstacles overlap and there is no valid escape position)
+    if (insertions.length >= prevInsertCount && prevInsertCount !== -1) break;
+    prevInsertCount = insertions.length;
 
     // Apply insertions in reverse so earlier indices stay valid
     for (let k = insertions.length - 1; k >= 0; k--) {
@@ -330,12 +383,16 @@ function resolveVertex(pt, obstacles, pushStrength = 1.0, maxIter = 10) {
  * @returns {{ path, collisionPoints, totalPushes, timeUs, resolved }}
  */
 function collisionAwareChaikin(controlPoints, obstacles, iterations = 4, alpha = 0.25, pushStrength = 1.0, maxPushIter = 5) {
-  const t0 = performance.now();
+  const t0       = performance.now();
+  const deadline = t0 + 50; // 50 ms hard cap — prevents UI freeze on overlapping obstacles
   let path = copyPath(controlPoints);
   let totalPushes = 0;
-  const collisionPoints = [];  // Recorded only on final iteration for accurate visualization
+  const collisionPoints = [];
 
   for (let iter = 0; iter < iterations; iter++) {
+    // Global timeout guard — bail entire Chaikin loop if over budget
+    if (performance.now() > deadline) break;
+
     const isLastIter = (iter === iterations - 1);
 
     // 1. Standard subdivision pass
@@ -343,7 +400,7 @@ function collisionAwareChaikin(controlPoints, obstacles, iterations = 4, alpha =
 
     // 2. Vertex resolution: push any vertex that landed inside an obstacle
     for (let i = 0; i < path.length; i++) {
-      if (i === 0 || i === path.length - 1) continue; // anchors are immovable
+      if (i === 0 || i === path.length - 1) continue;
       const before = { x: path[i].x, y: path[i].y };
       const { pt, pushCount, resolved } = resolveVertex(path[i], obstacles, pushStrength, maxPushIter);
       if (pushCount > 0) {
@@ -355,12 +412,11 @@ function collisionAwareChaikin(controlPoints, obstacles, iterations = 4, alpha =
       path[i] = pt;
     }
 
-    // 3. Edge resolution: detect segments that tunnel through an obstacle
-    //    (both endpoints outside but the segment crosses the boundary).
-    //    Insert a resolved midpoint for each such crossing.
-    const before = path.length;
-    path = resolveEdges(path, obstacles, pushStrength, maxPushIter);
-    totalPushes += (path.length - before); // count insertions as constraint operations
+    // 3. Edge resolution: insert resolved midpoints for tunnelling segments.
+    //    Pass the deadline so resolveEdges can bail early too.
+    const lenBefore = path.length;
+    path = resolveEdges(path, obstacles, pushStrength, maxPushIter, deadline);
+    totalPushes += (path.length - lenBefore);
   }
 
   const timeUs = (performance.now() - t0) * 1000;
