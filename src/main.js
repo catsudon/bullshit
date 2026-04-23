@@ -33,6 +33,7 @@
   let lastFPSTime = performance.now();
   let frameCount = 0;
   let currentFPS = 0;
+  let _lastPreset = 'maze'; // track last preset for zoom-reset
 
   /* ─── Canvas Setup ──────────────────────────────────────────────────────────── */
   const canvas = document.getElementById('main-canvas');
@@ -67,6 +68,9 @@
 
     state.stdPath    = stdResult.path;
     state.awareResult = awareResult;
+    // Cache violation counts so the renderer doesn't recompute every frame
+    state.stdViol  = Algo.findCollisions(stdResult.path, state.obstacles).length;
+    state.awaViol  = Algo.findCollisions(awareResult.path, state.obstacles).length;
 
     updateMetrics(stdResult, awareResult, wallTime);
     updateMiniChart();
@@ -89,8 +93,9 @@
       return;
     }
 
-    const stdViol = Algo.findCollisions(stdResult.path, state.obstacles).length;
-    const awaViol = Algo.findCollisions(awareResult.path, state.obstacles).length;
+    // Reuse cached violation counts computed in recompute() — no extra O(n·m) pass here
+    const stdViol = state.stdViol ?? 0;
+    const awaViol = state.awaViol ?? 0;
 
     document.getElementById('std-verts').textContent = stdResult.path.length;
     document.getElementById('std-coll').textContent  = stdViol;
@@ -120,21 +125,11 @@
   /* ─── Mini Chart Update ─────────────────────────────────────────────────────── */
   function updateMiniChart() {
     const miniCanvas = document.getElementById('bench-chart');
+    // Only draw real data; never show fabricated placeholder lines
     if (benchData) {
       Renderer.drawBenchChart(miniCanvas, benchData);
     } else {
-      // Draw placeholder with current point info
-      const n = state.waypoints.length;
-      if (n >= 2) {
-        const fakeData = {
-          ns:        [2, 3, 5, 8, n],
-          stdTimes:  [0.5, 1.0, 2.0, 3.5, (state.stdPath?.length || 0) * 0.002],
-          awareTimes:[0.8, 1.5, 3.0, 5.0, (state.awareResult?.path?.length || 0) * 0.003],
-        };
-        Renderer.drawBenchChart(miniCanvas, fakeData);
-      } else {
-        Renderer.drawBenchChart(miniCanvas, null);
-      }
+      Renderer.drawBenchChart(miniCanvas, null);
     }
   }
 
@@ -215,8 +210,10 @@
     const cursor = document.getElementById('obstacle-cursor');
     if (state.mode === 'obstacle-circle') {
       cursor.style.display = 'block';
-      cursor.style.left = (e.clientX - canvas.getBoundingClientRect().left) + 'px';
-      cursor.style.top  = (e.clientY - canvas.getBoundingClientRect().top)  + 'px';
+      // Position relative to canvas element (not canvas-container) to avoid toolbar offset
+      const canvasRect = canvas.getBoundingClientRect();
+      cursor.style.left = (e.clientX - canvasRect.left) + 'px';
+      cursor.style.top  = (e.clientY - canvasRect.top)  + 'px';
       const r = state.rectDrag ? Math.hypot(x - state.rectDrag.x, y - state.rectDrag.y) : 30;
       cursor.style.width  = (r * 2) + 'px';
       cursor.style.height = (r * 2) + 'px';
@@ -319,6 +316,7 @@
 
   /* ─── Presets ───────────────────────────────────────────────────────────────── */
   function loadPreset(name) {
+    _lastPreset = name;
     state.waypoints  = [];
     state.obstacles  = [];
     const W = canvas.width, H = canvas.height;
@@ -493,8 +491,8 @@
     recompute();
   });
   document.getElementById('btn-zoom-reset').addEventListener('click', () => {
-    // re-scale to fit current canvas
-    recompute();
+    // Reload the current preset if active, otherwise just refit to canvas
+    loadPreset(_lastPreset || 'maze');
   });
 
   /* ─── Keyboard Shortcuts ────────────────────────────────────────────────────── */

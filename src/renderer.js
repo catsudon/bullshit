@@ -291,14 +291,14 @@ window.Renderer = (function () {
   /**
    * Draw the obstacle count badges on canvas (top-left info)
    */
-  function drawCanvasInfo(ctx, stdPath, awareResult, obstacles) {
+  function drawCanvasInfo(ctx, stdPath, awareResult, obstacles, stdViol, awaViol) {
     const lines = [];
     if (stdPath) lines.push({ label: 'Std vertices:', val: stdPath.length, color: '#f59e0b' });
     if (awareResult) {
-      const viol = window.Algo.findCollisions(stdPath || [], obstacles).length;
-      lines.push({ label: 'Std violations:', val: viol, color: viol > 0 ? '#f87171' : '#22c55e' });
+      // Use pre-cached violation counts (computed in recompute(), not per-frame)
+      lines.push({ label: 'Std violations:', val: stdViol ?? 0, color: (stdViol ?? 0) > 0 ? '#f87171' : '#22c55e' });
       lines.push({ label: 'Aware vertices:', val: awareResult.path.length, color: '#10b981' });
-      lines.push({ label: 'Aware violations:', val: window.Algo.findCollisions(awareResult.path, obstacles).length, color: '#22c55e' });
+      lines.push({ label: 'Aware violations:', val: awaViol ?? 0, color: '#22c55e' });
     }
 
     if (lines.length === 0) return;
@@ -371,8 +371,8 @@ window.Renderer = (function () {
       drawRectPreview(ctx, Math.min(x, cx), Math.min(y, cy), Math.abs(cx - x), Math.abs(cy - y));
     }
 
-    // Canvas info badge
-    drawCanvasInfo(ctx, state.stdPath, state.awareResult, state.obstacles);
+    // Canvas info badge (reads cached violation counts from state)
+    drawCanvasInfo(ctx, state.stdPath, state.awareResult, state.obstacles, state.stdViol, state.awaViol);
   }
 
   /**

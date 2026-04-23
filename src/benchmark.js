@@ -6,7 +6,7 @@
 'use strict';
 
 window.Benchmark = (function () {
-  const { standardChaikin, collisionAwareChaikin } = window.Algo;
+  // Access Algo at call-time (not parse-time) to avoid load-order crashes
 
   /**
    * Generate a random path with N waypoints spread across the canvas
@@ -77,8 +77,8 @@ window.Benchmark = (function () {
       const path = generateRandomPath(n, W, H);
       const ITERS = 4;
 
-      const stdT = measureAvg(() => standardChaikin(path, ITERS, 0.25), 5);
-      const awaT = measureAvg(() => collisionAwareChaikin(path, obstacles, ITERS, 0.25, 1.0, 5), 5);
+      const stdT = measureAvg(() => window.Algo.standardChaikin(path, ITERS, 0.25), 5);
+      const awaT = measureAvg(() => window.Algo.collisionAwareChaikin(path, obstacles, ITERS, 0.25, 1.0, 5), 5);
 
       stdTimes.push(stdT);
       awareTimes.push(awaT);

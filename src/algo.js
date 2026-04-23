@@ -134,7 +134,7 @@ function findCollisions(path, obstacles) {
 
 /**
  * Test if segment (A→B) intersects a circle obstacle.
- * Returns { hit, point, normal, t } where t in [0,1] is the closest parametric point.
+ * Returns { hit, tEntry, tExit } where tEntry/tExit are parametric [0,1].
  */
 function segmentCircle(ax, ay, bx, by, obs) {
   const dx = bx - ax, dy = by - ay;
@@ -147,14 +147,100 @@ function segmentCircle(ax, ay, bx, by, obs) {
   discriminant = Math.sqrt(discriminant);
   const t1 = (-b - discriminant) / (2 * a);
   const t2 = (-b + discriminant) / (2 * a);
-  // Check if segment passes through
   if (t1 <= 1 && t2 >= 0) {
-    const t = clamp((t1 + t2) / 2, 0, 1);
-    const px = ax + dx * t, py = ay + dy * t;
-    const nm = vnorm({ x: px - obs.x, y: py - obs.y });
-    return { hit: true, t, px, py, normal: nm };
+    return { hit: true, tEntry: Math.max(t1, 0), tExit: Math.min(t2, 1) };
   }
   return { hit: false };
+}
+
+/**
+ * Test if segment (A→B) intersects a rectangle obstacle.
+ * Uses Liang-Barsky parametric clipping.
+ * Returns { hit, tEntry, tExit }.
+ */
+function segmentVsRect(ax, ay, bx, by, obs) {
+  const dx = bx - ax, dy = by - ay;
+  // p[i] * t <= q[i] for each of 4 half-planes
+  const p = [-dx,  dx, -dy,  dy];
+  const q = [
+    ax - obs.x,
+    obs.x + obs.w - ax,
+    ay - obs.y,
+    obs.y + obs.h - ay,
+  ];
+  let tEntry = 0, tExit = 1;
+  for (let i = 0; i < 4; i++) {
+    if (Math.abs(p[i]) < 1e-10) {
+      // Parallel to slab — reject if outside
+      if (q[i] < 0) return { hit: false };
+    } else {
+      const t = q[i] / p[i];
+      if (p[i] < 0) { if (t > tEntry) tEntry = t; }
+      else          { if (t < tExit)  tExit  = t; }
+    }
+    if (tEntry > tExit) return { hit: false };
+  }
+  return { hit: tEntry < tExit, tEntry, tExit };
+}
+
+/**
+ * Unified segment-vs-obstacle test.
+ */
+function segmentVsObstacle(ax, ay, bx, by, obs) {
+  if (obs.type === 'circle') return segmentCircle(ax, ay, bx, by, obs);
+  if (obs.type === 'rect')   return segmentVsRect(ax, ay, bx, by, obs);
+  return { hit: false };
+}
+
+/**
+ * Edge resolution — iterative version.
+ *
+ * A single midpoint insertion is not enough for wide obstacles:
+ *   A ──────────[rect]────────── B
+ * Inserting pushed midpoint M gives:  A → M → B
+ * but A→M and M→B can STILL cross the rect.
+ *
+ * Fix: repeat the scan+insert cycle until the full path has zero
+ * edge-obstacle crossings (converged), capped at MAX_PASSES to prevent
+ * infinite loops in degenerate geometry.
+ *
+ * @param {Array<{x,y}>} path
+ * @param {Array}        obstacles
+ * @param {number}       pushStrength
+ * @param {number}       maxIter      - vertex push iterations
+ * @returns {Array<{x,y}>}  resolved path (may have extra vertices)
+ */
+function resolveEdges(path, obstacles, pushStrength, maxIter) {
+  const MAX_PASSES = 32; // safety cap — each pass at least halves uncrossed length
+
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const insertions = [];
+
+    for (let i = 0; i < path.length - 1; i++) {
+      const A = path[i], B = path[i + 1];
+      for (const obs of obstacles) {
+        const hit = segmentVsObstacle(A.x, A.y, B.x, B.y, obs);
+        if (!hit.hit) continue;
+        // Midpoint of the intersection chord (guaranteed inside obstacle)
+        const tMid = (hit.tEntry + hit.tExit) / 2;
+        const mx = A.x + (B.x - A.x) * tMid;
+        const my = A.y + (B.y - A.y) * tMid;
+        // Push it out of all obstacles
+        const { pt } = resolveVertex({ x: mx, y: my }, obstacles, pushStrength, maxIter);
+        insertions.push({ after: i, pt });
+        break; // one insertion per edge, re-scan next pass
+      }
+    }
+
+    // No crossings found — path is fully clear
+    if (insertions.length === 0) break;
+
+    // Apply insertions in reverse so earlier indices stay valid
+    for (let k = insertions.length - 1; k >= 0; k--) {
+      path.splice(insertions[k].after + 1, 0, insertions[k].pt);
+    }
+  }
+  return path;
 }
 
 /* ─── Standard Chaikin's Algorithm ─────────────────────────────────────────── */
@@ -247,23 +333,34 @@ function collisionAwareChaikin(controlPoints, obstacles, iterations = 4, alpha =
   const t0 = performance.now();
   let path = copyPath(controlPoints);
   let totalPushes = 0;
-  const collisionPoints = [];  // Points that were pushed
+  const collisionPoints = [];  // Recorded only on final iteration for accurate visualization
 
   for (let iter = 0; iter < iterations; iter++) {
+    const isLastIter = (iter === iterations - 1);
+
     // 1. Standard subdivision pass
     path = chaikinPass(path, alpha);
 
-    // 2. Resolve collisions for each vertex
+    // 2. Vertex resolution: push any vertex that landed inside an obstacle
     for (let i = 0; i < path.length; i++) {
-      // Don't move the first/last waypoints (anchors)
-      if ((i === 0 || i === path.length - 1) && iter === iterations - 1) continue;
+      if (i === 0 || i === path.length - 1) continue; // anchors are immovable
+      const before = { x: path[i].x, y: path[i].y };
       const { pt, pushCount, resolved } = resolveVertex(path[i], obstacles, pushStrength, maxPushIter);
       if (pushCount > 0) {
-        collisionPoints.push({ x: path[i].x, y: path[i].y, px: pt.x, py: pt.y, resolved });
+        if (isLastIter) {
+          collisionPoints.push({ x: before.x, y: before.y, px: pt.x, py: pt.y, resolved });
+        }
         totalPushes += pushCount;
       }
       path[i] = pt;
     }
+
+    // 3. Edge resolution: detect segments that tunnel through an obstacle
+    //    (both endpoints outside but the segment crosses the boundary).
+    //    Insert a resolved midpoint for each such crossing.
+    const before = path.length;
+    path = resolveEdges(path, obstacles, pushStrength, maxPushIter);
+    totalPushes += (path.length - before); // count insertions as constraint operations
   }
 
   const timeUs = (performance.now() - t0) * 1000;
@@ -274,10 +371,12 @@ function collisionAwareChaikin(controlPoints, obstacles, iterations = 4, alpha =
 /* ─── Memory Estimation ──────────────────────────────────────────────────────── */
 
 /**
- * Estimate memory for a path (each {x,y} = 2 doubles = 16 bytes)
+ * Estimate memory for a path.
+ * Each JS {x,y} object ≈ 64 bytes in V8 (object header ~48B + 2×f64 = 16B).
+ * Using 64 bytes per point as a realistic lower bound.
  */
 function estimateMemoryKB(path) {
-  return ((path.length * 2 * 8) / 1024).toFixed(2);
+  return ((path.length * 64) / 1024).toFixed(2);
 }
 
 /* ─── Export ─────────────────────────────────────────────────────────────────── */
@@ -287,6 +386,9 @@ window.Algo = {
   findCollisions,
   testPoint,
   segmentCircle,
+  segmentVsRect,
+  segmentVsObstacle,
+  resolveEdges,
   estimateMemoryKB,
   copyPath,
   lerp2,
